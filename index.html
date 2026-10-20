@@ -170,6 +170,7 @@ const LANGS = [
 const $ = id => document.getElementById(id);
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 const IS_IOS = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+const STANDALONE = navigator.standalone === true || matchMedia("(display-mode: standalone)").matches; // ouverte depuis l'écran d'accueil
 // Sur iPhone, un micro relancé trop vite après avoir été coupé, ou juste après une lecture
 // à voix haute (le temps que l'iPhone rebascule son audio), reste « sourd » :
 // on laisse toujours au moins ces délais avant de rouvrir le micro.
@@ -195,6 +196,7 @@ const S = {
   flow:0,                               // change à chaque interruption : les suites devenues caduques s'arrêtent
   rec:null, recId:0, dying:null, startTimer:null,
   recAlive:false, audioLive:false, sawAudioStart:false, failures:0,
+  langWorked:{}, stuckHint:"",          // langues déjà reconnues au moins une fois sur cet appareil
   recStartedAt:0, lastEvent:0, lastAbort:0, lastSpeechEnd:0, notLiveSince:0,
   finalText:"", interim:"", lastHeard:0, sayLang:"",
   ticker:null, wake:null, log:[]
@@ -217,7 +219,7 @@ $("copyLog").onclick = async () => {
   }
   setTimeout(() => { $("copyLog").textContent = "Copier le journal"; }, 2500);
 };
-log("appareil : " + (IS_IOS ? "iPhone/iPad" : "autre") + " · " + navigator.userAgent);
+log("appareil : " + (IS_IOS ? "iPhone/iPad" : "autre") + " · " + (STANDALONE ? "appli de l'écran d'accueil" : "navigateur") + " · " + navigator.userAgent);
 
 // ---------- UI ----------
 for (const id of ["langA","langB"]) {
@@ -290,7 +292,7 @@ function render(){
     $("status").textContent = "Lecture à voix haute…";
   } else if (S.phase==="stuck"){
     orb.textContent = "Toucher pour relancer";
-    $("status").textContent = "Le téléphone a bloqué le micro. Touchez le bouton pour le relancer ; si ça ne repart pas, rechargez l'appli.";
+    $("status").textContent = S.stuckHint || "Le téléphone a bloqué le micro. Touchez le bouton pour le relancer ; si ça ne repart pas, rechargez l'appli.";
   }
   orb.title = "Toucher pour mettre en pause";
 }
@@ -384,7 +386,16 @@ function openRec(){
 // Plusieurs écoutes ratées d'affilée : inutile d'insister, on attend un toucher
 // (sur iPhone, une relance faite depuis un geste de l'utilisateur a plus de chances de marcher).
 function micStuck(){
-  log("le micro ne repart pas, j'attends un toucher");
+  // Sur iPhone, une langue qui n'a jamais marché alors qu'une autre oui : c'est presque
+  // toujours la dictée de cette langue qui n'est pas installée sur le téléphone.
+  const lang = fromLang();
+  const langMissing = IS_IOS && !S.langWorked[lang] && Object.keys(S.langWorked).length > 0;
+  S.stuckHint = langMissing
+    ? "La reconnaissance vocale ne marche pas pour « " + langName(lang) + " » sur ce téléphone. "
+      + (STANDALONE ? "Essayez dans Safari plutôt que depuis l'icône, ou ajoutez" : "Ajoutez")
+      + " le clavier de cette langue avec la dictée activée (Réglages > Général > Clavier > Claviers), puis touchez le bouton."
+    : "";
+  log(langMissing ? "« " + langName(lang) + " » n'a jamais été reconnu sur cet appareil : dictée de cette langue absente ?" : "le micro ne repart pas, j'attends un toucher");
   killRec();
   S.phase = "stuck";
   $("reload").hidden = false;
@@ -426,7 +437,7 @@ function startRec(id){
   rec.onnomatch     = () => { if (mine()) log("rien de compris"); };
   rec.onresult = e => {
     if (!mine()) return;
-    S.failures = 0;
+    S.failures = 0; S.langWorked[rec.lang] = true;
     S.recAlive = true; S.lastEvent = S.lastHeard = Date.now();
     if (S.sawAudioStart) S.audioLive = true;
     let interim = "";
