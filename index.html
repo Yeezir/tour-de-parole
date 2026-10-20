@@ -4,8 +4,6 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#14181f">
-<meta name="mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-capable" content="yes">
 <title>Tour de Parole</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@500;700&family=Atkinson+Hyperlegible:wght@400;700&display=swap">
@@ -95,6 +93,10 @@ summary{font-weight:700;cursor:pointer}
 <div class="wrap">
   <h1>Tour de Parole<small>Posez le téléphone, parlez, il traduit à voix haute après chaque phrase.</small></h1>
 
+  <div id="iconWarn" class="warn" hidden>
+    Ouverte depuis l'icône de l'écran d'accueil, l'appli ne reconnaît souvent que la langue du téléphone. Pour converser dans deux langues, ouvrez <b id="pageUrl"></b> dans Safari.
+  </div>
+
   <div id="unsupported" class="warn" hidden>
     Ce navigateur ne propose pas la reconnaissance vocale. Ouvrez la page dans <b>Chrome</b> (Android, ordinateur) ou <b>Safari</b> (iPhone, iOS 14.5+), via une adresse <b>https://</b>.
   </div>
@@ -171,11 +173,11 @@ const $ = id => document.getElementById(id);
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 const IS_IOS = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
 const STANDALONE = navigator.standalone === true || matchMedia("(display-mode: standalone)").matches; // ouverte depuis l'écran d'accueil
-// Sur iPhone, un micro relancé trop vite après avoir été coupé, ou juste après une lecture
-// à voix haute (le temps que l'iPhone rebascule son audio), reste « sourd » :
-// on laisse toujours au moins ces délais avant de rouvrir le micro.
-const RESTART_GAP = IS_IOS ? 3000 : 300;
-const AFTER_SPEECH_GAP = IS_IOS ? 1500 : 400;
+// Sur iPhone, un micro relancé moins d'une seconde après avoir été coupé reste « sourd » :
+// on laisse ce délai entre une coupure et la reprise (il s'écoule en général pendant la
+// lecture de la traduction). Après une lecture, on attend juste que le haut-parleur se taise.
+const RESTART_GAP = IS_IOS ? 2000 : 300;
+const AFTER_SPEECH_GAP = 400;
 const MAX_FAILURES = 3;   // écoutes ratées d'affilée avant de demander un toucher
 const T0 = Date.now();
 
@@ -298,6 +300,7 @@ function render(){
 }
 
 if (!SR){ $("unsupported").hidden = false; }
+if (IS_IOS && STANDALONE){ $("pageUrl").textContent = location.host + location.pathname; $("iconWarn").hidden = false; }
 
 // ---------- Démarrage / arrêt ----------
 $("orb").onclick = () => S.phase==="stuck" ? resumeAfterStuck() : S.running ? stop() : start();
@@ -387,16 +390,16 @@ function openRec(){
 // (sur iPhone, une relance faite depuis un geste de l'utilisateur a plus de chances de marcher).
 function micStuck(refused = false){
   // Sur iPhone, une langue refusée par la dictée, ou qui n'a jamais marché alors qu'une autre
-  // oui : la dictée de cette langue n'est pas installée sur le téléphone. Depuis l'icône de
-  // l'écran d'accueil, seules ces langues-là sont reconnues ; dans Safari, les autres passent
-  // par les serveurs d'Apple.
+  // oui. Depuis l'icône de l'écran d'accueil, l'iPhone ne reconnaît souvent que la langue du
+  // téléphone, même avec le clavier de l'autre langue ; dans Safari, les autres langues passent
+  // par les serveurs d'Apple, qui limitent le nombre d'écoutes.
   const lang = fromLang();
   const langMissing = IS_IOS && (refused || (!S.langWorked[lang] && Object.keys(S.langWorked).length > 0));
   S.stuckHint = langMissing
     ? "L'iPhone refuse de reconnaître « " + langName(lang) + " ». "
       + (STANDALONE
-        ? "Depuis l'icône de l'écran d'accueil, il ne reconnaît souvent que les langues de dictée installées : ouvrez la page dans Safari, ou ajoutez le clavier de cette langue avec la dictée (Réglages > Général > Clavier > Claviers)."
-        : "Ajoutez le clavier de cette langue avec la dictée activée (Réglages > Général > Clavier > Claviers), puis touchez le bouton.")
+        ? "Depuis l'icône de l'écran d'accueil, il ne reconnaît souvent que la langue du téléphone : ouvrez la page dans Safari."
+        : "Vérifiez que le clavier de cette langue est ajouté avec la dictée activée (Réglages > Général > Clavier > Claviers), ou réessayez un peu plus tard : l'iPhone limite le nombre d'écoutes.")
     : "";
   log(langMissing ? "« " + langName(lang) + " » refusé par la dictée de l'iPhone" : "le micro ne repart pas, j'attends un toucher");
   killRec();
@@ -524,7 +527,9 @@ function tick(){
     let why = "", broken = true;
     if (!S.recAlive && age > 4000) why = "l'écoute ne démarre pas";
     else if (S.sawAudioStart && !S.audioLive && age > 4000) why = "le micro ne s'ouvre pas";
-    else if (now - S.lastEvent > (IS_IOS ? 15000 : 10000)){ why = "plus aucun signe du micro"; broken = false; } // peut-être juste du silence
+    // Peut-être juste du silence. Sur iPhone, une écoute silencieuse reste ouverte sans souci, et
+    // chaque relance est une demande de plus aux serveurs d'Apple, qui les limitent : on attend longtemps.
+    else if (now - S.lastEvent > (IS_IOS ? 60000 : 10000)){ why = "plus aucun signe du micro"; broken = false; }
     if (why){
       log(why + ", je relance");
       if (S.interim){ S.finalText = (S.finalText + " " + S.interim).trim(); S.interim = ""; }
