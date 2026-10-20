@@ -53,9 +53,10 @@ button{cursor:pointer}
 .orb{--c:var(--muted);width:150px;height:150px;border-radius:50%;border:0;position:relative;
   background:radial-gradient(circle at 35% 30%,color-mix(in srgb,var(--c) 70%,#fff),var(--c));
   color:#fff;font:700 1.05rem var(--display);display:grid;place-items:center;text-align:center;padding:16px;white-space:pre-line;
-  box-shadow:0 10px 30px color-mix(in srgb,var(--c) 35%,transparent);transition:transform .2s}
+  box-shadow:0 10px 30px color-mix(in srgb,var(--c) 35%,transparent);transition:transform .2s,opacity .3s}
 .orb:active{transform:scale(.97)}
 .orb.A{--c:var(--a)} .orb.B{--c:var(--b)}
+.orb.waiting{opacity:.5}
 .orb::after{content:"";position:absolute;inset:-10px;border-radius:50%;border:3px solid var(--c);opacity:0}
 .orb.listening::after{animation:pulse 1.6s ease-out infinite}
 .orb.hearing::after{animation-duration:.7s}
@@ -80,11 +81,14 @@ summary{font-weight:700;cursor:pointer}
 .set{display:flex;flex-direction:column;gap:4px;margin-top:12px}
 .set label{display:flex;justify-content:space-between;font-size:.9rem}
 .set input[type=range]{width:100%;accent-color:var(--a)}
-.set .hint{font-size:.8rem;color:var(--muted)}
+.hint{font-size:.8rem;color:var(--muted)}
 .chk{display:flex;gap:8px;align-items:center;margin-top:12px;font-size:.9rem}
 .warn{background:var(--b-soft);border:1px solid var(--b);border-radius:12px;padding:10px 12px;font-size:.9rem}
 .row{display:flex;gap:8px;flex-wrap:wrap}
 .ghost{border:1px solid var(--line);background:transparent;border-radius:10px;padding:8px 12px;font-size:.9rem}
+#journal .hint{margin:8px 0}
+#logBox{font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--bg);border-radius:8px;padding:8px;
+  max-height:260px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;margin:0 0 10px}
 </style>
 </head>
 <body>
@@ -143,19 +147,32 @@ summary{font-weight:700;cursor:pointer}
       <button class="ghost" id="clear">Effacer la conversation</button>
     </div>
   </details>
+
+  <details id="journal">
+    <summary>Journal technique</summary>
+    <p class="hint">Si le micro se bloque, ouvrez ceci juste après et envoyez une capture d'écran ou le texte copié : on y voit ce que fait le téléphone.</p>
+    <pre id="logBox"></pre>
+    <button class="ghost" id="copyLog">Copier le journal</button>
+  </details>
 </div>
 
 <script>
 const LANGS = [
-  ["fr-FR","Français"],["en-US","Anglais (US)"],["en-GB","Anglais (UK)"],["es-ES","Espagnol"],
-  ["de-DE","Allemand"],["it-IT","Italien"],["pt-PT","Portugais"],["pt-BR","Portugais (Brésil)"],
-  ["nl-NL","Néerlandais"],["pl-PL","Polonais"],["ru-RU","Russe"],["uk-UA","Ukrainien"],
-  ["ar-SA","Arabe"],["tr-TR","Turc"],["el-GR","Grec"],["sv-SE","Suédois"],["ro-RO","Roumain"],
-  ["hi-IN","Hindi"],["ja-JP","Japonais"],["ko-KR","Coréen"],["zh-CN","Chinois (mandarin)"],
-  ["vi-VN","Vietnamien"],["th-TH","Thaï"],["id-ID","Indonésien"],["he-IL","Hébreu"]
+  // code, nom en français, nom dans la langue elle-même (annoncé quand on change de locuteur)
+  ["fr-FR","Français","Français"],["en-US","Anglais (US)","English"],["en-GB","Anglais (UK)","English"],["es-ES","Espagnol","Español"],
+  ["de-DE","Allemand","Deutsch"],["it-IT","Italien","Italiano"],["pt-PT","Portugais","Português"],["pt-BR","Portugais (Brésil)","Português"],
+  ["nl-NL","Néerlandais","Nederlands"],["pl-PL","Polonais","Polski"],["ru-RU","Russe","Русский"],["uk-UA","Ukrainien","Українська"],
+  ["ar-SA","Arabe","العربية"],["tr-TR","Turc","Türkçe"],["el-GR","Grec","Ελληνικά"],["sv-SE","Suédois","Svenska"],["ro-RO","Roumain","Română"],
+  ["hi-IN","Hindi","हिन्दी"],["ja-JP","Japonais","日本語"],["ko-KR","Coréen","한국어"],["zh-CN","Chinois (mandarin)","中文"],
+  ["vi-VN","Vietnamien","Tiếng Việt"],["th-TH","Thaï","ภาษาไทย"],["id-ID","Indonésien","Bahasa Indonesia"],["he-IL","Hébreu","עברית"]
 ];
 const $ = id => document.getElementById(id);
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+const IS_IOS = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+// Sur iPhone, un micro relancé trop vite après avoir été coupé reste « sourd » :
+// on laisse toujours au moins ce délai entre une coupure et la reprise.
+const RESTART_GAP = IS_IOS ? 3000 : 300;
+const T0 = Date.now();
 
 const store = {
   get(k, d){ try{ const v = localStorage.getItem("tdp."+k); return v === null ? d : JSON.parse(v); }catch{ return d; } },
@@ -171,8 +188,32 @@ const S = {
   repeatOrig: store.get("repeatOrig",false),
   running:false, phase:"idle",          // idle | listening | translating | speaking
   turn:"A",
-  rec:null, recId:0, finalText:"", interim:"", lastHeard:0, ticker:null, wake:null
+  flow:0,                               // change à chaque interruption : les suites devenues caduques s'arrêtent
+  rec:null, recId:0, dying:null, startTimer:null,
+  recAlive:false, audioLive:false, sawAudioStart:false,
+  recStartedAt:0, lastEvent:0, lastAbort:0, notLiveSince:0,
+  finalText:"", interim:"", lastHeard:0, sayLang:"",
+  ticker:null, wake:null, log:[]
 };
+
+// ---------- Journal technique ----------
+function log(msg){
+  S.log.push(((Date.now()-T0)/1000).toFixed(1).padStart(6) + "  " + msg);
+  if (S.log.length > 120) S.log.shift();
+  if ($("journal").open) showLog();
+}
+function showLog(){ const box = $("logBox"); box.textContent = S.log.join("\n"); box.scrollTop = box.scrollHeight; }
+$("journal").addEventListener("toggle", () => { if ($("journal").open) showLog(); });
+$("copyLog").onclick = async () => {
+  try{ await navigator.clipboard.writeText(S.log.join("\n")); $("copyLog").textContent = "Journal copié"; }
+  catch{
+    const r = document.createRange(); r.selectNodeContents($("logBox"));
+    const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r);
+    $("copyLog").textContent = "Texte sélectionné, copiez-le";
+  }
+  setTimeout(() => { $("copyLog").textContent = "Copier le journal"; }, 2500);
+};
+log("appareil : " + (IS_IOS ? "iPhone/iPad" : "autre") + " · " + navigator.userAgent);
 
 // ---------- UI ----------
 for (const id of ["langA","langB"]) {
@@ -207,10 +248,11 @@ $("pause").oninput = e => { S.pause = +e.target.value; store.set("pause",S.pause
 $("rate").oninput  = e => { S.rate  = +e.target.value; store.set("rate",S.rate); showSettings(); };
 $("repeatOrig").onchange = e => { S.repeatOrig = e.target.checked; store.set("repeatOrig",S.repeatOrig); };
 $("clear").onclick = () => { $("log").querySelectorAll(".turn").forEach(n=>n.remove()); $("empty").hidden = false; };
-$("skip").onclick = () => { S.turn = S.turn==="A" ? "B" : "A"; restartListening(); };
+$("skip").onclick = () => switchSpeaker();
 showSettings();
 
-const langName = code => (LANGS.find(l=>l[0]===code)||[code,code])[1];
+const langName   = code => (LANGS.find(l=>l[0]===code)||[code,code])[1];
+const nativeName = code => (LANGS.find(l=>l[0]===code)||[code,code,code])[2];
 const fromLang = () => S.turn==="A" ? S.langA : S.langB;
 const toLang   = () => S.turn==="A" ? S.langB : S.langA;
 
@@ -222,17 +264,25 @@ function render(){
   if (!S.running){ orb.textContent = "Démarrer"; return; }
   orb.classList.add(S.turn);
   if (S.phase==="listening"){
-    orb.classList.add("listening");
-    if (Date.now()-S.lastHeard < 800) orb.classList.add("hearing");
-    orb.textContent = "J'écoute\n" + langName(fromLang());
-    $("status").textContent = (S.mode==="conv" && S.turn==="B" ? "À l'autre personne de parler · " : "À vous · ") + langName(fromLang());
+    // On n'affiche « J'écoute » que lorsque le micro est réellement ouvert
+    const live = S.sawAudioStart ? S.audioLive : S.recAlive;
+    if (!live && Date.now() - S.notLiveSince > 700){
+      orb.classList.add("waiting");
+      orb.textContent = "Un instant…";
+      $("status").textContent = "Je prépare le micro (" + langName(fromLang()) + "), attendez avant de parler.";
+    } else {
+      orb.classList.add("listening");
+      if (Date.now()-S.lastHeard < 800) orb.classList.add("hearing");
+      orb.textContent = "J'écoute\n" + langName(fromLang());
+      $("status").textContent = (S.mode==="conv" && S.turn==="B" ? "À l'autre personne de parler · " : "À vous · ") + langName(fromLang());
+    }
   } else if (S.phase==="translating"){
     orb.textContent = "Traduction…";
     $("status").textContent = "Traduction en " + langName(toLang()).toLowerCase() + "…";
   } else if (S.phase==="speaking"){
     orb.classList.add("speaking");
-    orb.textContent = langName(toLang());
-    $("status").textContent = "Lecture de la traduction…";
+    orb.textContent = langName(S.sayLang || toLang());
+    $("status").textContent = "Lecture à voix haute…";
   }
   orb.title = "Toucher pour mettre en pause";
 }
@@ -244,30 +294,35 @@ $("orb").onclick = () => S.running ? stop() : start();
 
 function start(){
   if (!SR){ $("unsupported").hidden = false; return; }
-  S.running = true;
+  S.running = true; S.flow++;
   // Débloque la synthèse vocale sur mobile (doit partir d'un geste)
   try{ speechSynthesis.speak(new SpeechSynthesisUtterance(" ")); }catch{}
   keepAwake();
   $("skip").hidden = S.mode!=="conv";
+  log("démarrage");
   listen();
   S.ticker = setInterval(tick, 150);
 }
 function stop(){
-  S.running = false; S.phase = "idle";
+  S.running = false; S.phase = "idle"; S.flow++;
   clearInterval(S.ticker);
   killRec();
-  try{ speechSynthesis.cancel(); }catch{}
+  stopSpeaking();
   if (S.wake){ S.wake.release().catch(()=>{}); S.wake = null; }
   $("skip").hidden = true;
   $("status").textContent = "En pause. Touchez pour reprendre.";
   $("live").textContent = "";
+  log("pause");
   render();
 }
 async function keepAwake(){
   try{ S.wake = await navigator.wakeLock?.request("screen"); }catch{}
 }
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState==="visible" && S.running && !S.wake) keepAwake();
+  if (document.visibilityState !== "visible" || !S.running) return;
+  if (!S.wake) keepAwake();
+  // En revenant sur l'appli, l'écoute a souvent été coupée par le système : on la relance
+  if (S.phase==="listening"){ log("retour sur l'appli"); openRec(); }
 });
 
 // ---------- Écoute ----------
@@ -275,14 +330,18 @@ document.addEventListener("visibilitychange", () => {
 // On la relance aussitôt et on accumule le texte : c'est notre propre minuteur de
 // silence (réglable) qui décide quand le tour de parole est terminé.
 // Le navigateur n'accepte qu'une écoute à la fois : quand on en coupe une, on attend
-// qu'elle soit vraiment terminée avant d'en démarrer une autre.
+// qu'elle soit vraiment terminée, puis le délai RESTART_GAP, avant d'en démarrer une autre.
 function killRec(){
   S.recId++;
+  clearTimeout(S.startTimer);
   if (S.rec){
     const old = S.rec; S.rec = null;
-    S.dying = new Promise(res => { old.addEventListener("end", res); setTimeout(res, 700); });
+    S.lastAbort = Date.now();
+    S.dying = new Promise(res => { old.addEventListener("end", res); setTimeout(res, 1000); });
     try{ old.abort(); }catch{}
+    log("micro coupé");
   }
+  S.recAlive = false; S.audioLive = false; S.notLiveSince = Date.now();
 }
 function listen(){
   if (!S.running) return;
@@ -290,29 +349,42 @@ function listen(){
   S.finalText = ""; S.interim = "";
   $("live").textContent = "";
   openRec();
-  render();
 }
 function openRec(){
   killRec();
   const id = S.recId;
-  S.lastEvent = Date.now(); S.recAlive = false;
-  const waitFor = S.dying; S.dying = null;
-  if (waitFor) waitFor.then(() => setTimeout(() => startRec(id), 120));
-  else startRec(id);
+  const dying = S.dying; S.dying = null;
+  Promise.resolve(dying).then(() => {
+    if (id !== S.recId) return;
+    const wait = Math.max(120, S.lastAbort + RESTART_GAP - Date.now());
+    if (wait > 300) log("attente de " + (wait/1000).toFixed(1) + " s pour laisser le micro se remettre");
+    S.startTimer = setTimeout(() => startRec(id), wait);
+  });
+  render();
 }
 function startRec(id){
   if (id !== S.recId || !S.running || S.phase !== "listening") return;
-  S.lastEvent = Date.now();
+  const mine = () => id === S.recId;
   const rec = new SR();
   rec.lang = fromLang();
   rec.continuous = false;
   rec.interimResults = true;
   rec.maxAlternatives = 1;
-  const alive = () => { if (id === S.recId){ S.recAlive = true; S.lastEvent = Date.now(); } };
-  rec.onstart = alive; rec.onaudiostart = alive; rec.onspeechstart = alive;
+  let gotText = false;
+  rec.onstart = () => {
+    if (!mine()) return;
+    S.recAlive = true; S.lastEvent = Date.now();
+    log("écoute démarrée"); render();
+  };
+  rec.onaudiostart = () => {
+    if (!mine()) return;
+    S.recAlive = S.audioLive = S.sawAudioStart = true; S.lastEvent = Date.now();
+    log("micro ouvert"); render();
+  };
   rec.onresult = e => {
-    if (id !== S.recId) return;
-    alive();
+    if (!mine()) return;
+    S.recAlive = true; S.lastEvent = S.lastHeard = Date.now();
+    if (S.sawAudioStart) S.audioLive = true;
     let interim = "";
     for (let i = e.resultIndex; i < e.results.length; i++){
       const t = e.results[i][0].transcript;
@@ -320,67 +392,110 @@ function startRec(id){
       else interim += t;
     }
     S.interim = interim.trim();
-    S.lastHeard = Date.now();
     $("live").textContent = (S.finalText + " " + S.interim).trim();
+    if (!gotText){ gotText = true; log("paroles reconnues"); }
   };
   rec.onerror = e => {
-    if (id !== S.recId) return;
+    if (!mine()) return;
     S.lastEvent = Date.now();
+    log("erreur : " + e.error + (e.message ? " (" + e.message + ")" : ""));
     if (e.error==="not-allowed" || e.error==="service-not-allowed"){
       stop();
-      $("status").textContent = "Accès au micro refusé. Autorisez le micro pour ce site dans les réglages du navigateur.";
+      $("status").textContent = IS_IOS
+        ? "Micro ou dictée refusés. Autorisez le micro pour ce site, et activez la dictée (Réglages > Général > Clavier)."
+        : "Accès au micro refusé. Autorisez le micro pour ce site dans les réglages du navigateur.";
+      return;
     }
+    if (e.error !== "no-speech") S.lastAbort = Date.now(); // laisse le micro se remettre avant de réessayer
   };
   rec.onend = () => {
-    if (id !== S.recId) return;
+    if (!mine()) return;
+    log("fin de l'écoute");
     // Le moteur a coupé : on garde l'éventuel texte provisoire et on relance l'écoute
     if (S.interim){ S.finalText = (S.finalText + " " + S.interim).trim(); S.interim = ""; }
-    S.rec = null;
-    if (S.running && S.phase==="listening") setTimeout(() => { if (id === S.recId && S.phase==="listening") openRec(); }, 120);
+    S.rec = null; S.recAlive = false; S.audioLive = false;
+    if (S.running && S.phase==="listening") openRec();
   };
-  S.rec = rec;
-  try{ rec.start(); }catch{ S.rec = null; setTimeout(() => { if (id === S.recId && S.phase==="listening") openRec(); }, 400); }
+  S.rec = rec; S.recStartedAt = S.lastEvent = Date.now();
+  try{
+    rec.start();
+    log("lancement de l'écoute en " + langName(rec.lang));
+  }catch(err){
+    log("lancement refusé : " + (err && err.message));
+    S.rec = null; S.lastAbort = Date.now();
+    S.startTimer = setTimeout(() => { if (mine() && S.phase==="listening") openRec(); }, 500);
+  }
+}
+// Changement de locuteur à la main : on annonce à voix haute la langue de la personne
+// qui va parler, ce qui laisse aussi au micro de l'iPhone le temps de se remettre.
+function switchSpeaker(){
+  S.turn = S.turn==="A" ? "B" : "A";
+  const flow = ++S.flow;
+  log("changement de locuteur : " + langName(fromLang()));
+  if (!S.running){ render(); return; }
+  killRec();
+  stopSpeaking();
+  S.phase = "listening"; S.finalText = ""; S.interim = "";
+  $("live").textContent = "";
+  render();
+  setTimeout(() => {
+    if (flow !== S.flow || !S.running) return;
+    say(nativeName(fromLang()), fromLang()).then(() => { if (flow === S.flow && S.running) listen(); });
+  }, 250);
 }
 function restartListening(){
   if (!S.running) return;
-  try{ speechSynthesis.cancel(); }catch{}
+  S.flow++;
+  stopSpeaking();
   listen();
 }
 function tick(){
-  if (!S.running) return;
-  if (S.phase==="listening"){
-    const text = (S.finalText + " " + S.interim).trim();
-    if (text && Date.now() - S.lastHeard > S.pause){ endOfTurn(text); render(); return; }
-    // Sécurité : micro qui n'a jamais démarré, ou qui ne donne plus aucun signe de vie
-    if (Date.now() - S.lastEvent > (S.recAlive ? 10000 : 3000)){
+  if (!S.running || S.phase !== "listening") return;
+  const now = Date.now();
+  const text = (S.finalText + " " + S.interim).trim();
+  if (text && now - S.lastHeard > S.pause){ endOfTurn(text); return; }
+  // Sécurité : une écoute qui ne démarre pas, reste muette ou ne donne plus signe de vie est relancée
+  if (S.rec){
+    const age = now - S.recStartedAt;
+    let why = "";
+    if (!S.recAlive && age > 4000) why = "l'écoute ne démarre pas";
+    else if (S.sawAudioStart && !S.audioLive && age > 4000) why = "le micro ne s'ouvre pas";
+    else if (now - S.lastEvent > (IS_IOS ? 15000 : 10000)) why = "plus aucun signe du micro";
+    if (why){
+      log(why + ", je relance");
       if (S.interim){ S.finalText = (S.finalText + " " + S.interim).trim(); S.interim = ""; }
       openRec();
+      return;
     }
-    render();
   }
+  render();
 }
 
 // ---------- Traduction + lecture ----------
 async function endOfTurn(text){
+  const flow = ++S.flow;
   const speaker = S.turn, from = fromLang(), to = toLang();
   killRec();
+  log("fin du tour : « " + text + " »");
   S.phase = "translating"; render();
   let tr;
   try{ tr = await translate(text, from, to); }
   catch{
+    if (flow !== S.flow) return;
+    log("traduction impossible");
     $("status").textContent = "Traduction impossible (pas de réseau ?). Je réécoute.";
-    setTimeout(() => S.running && listen(), 1500);
+    setTimeout(() => { if (flow === S.flow && S.running) listen(); }, 1500);
     return;
   }
-  if (!S.running) return;
+  if (flow !== S.flow || !S.running) return;
   addTurn(speaker, text, tr, from, to);
   $("live").textContent = "";
   S.phase = "speaking"; render();
   if (S.repeatOrig) await say(text, from);
-  await say(tr, to);
-  if (!S.running) return;
+  if (flow === S.flow) await say(tr, to);
+  if (flow !== S.flow || !S.running) return;
   if (S.mode==="conv") S.turn = speaker==="A" ? "B" : "A";
-  setTimeout(() => S.running && S.phase==="speaking" && listen(), 400); // laisse retomber l'écho du haut-parleur
+  setTimeout(() => { if (flow === S.flow && S.running) listen(); }, 400); // laisse retomber l'écho du haut-parleur
 }
 
 const shortCode = c => (c==="zh-CN" || c==="pt-BR") ? c : c.split("-")[0];
@@ -411,7 +526,12 @@ function pickVoice(lang){
   const pool = exact.length ? exact : loose;
   return pool.find(v => /google|enhanced|premium|natural/i.test(v.name)) || pool[0] || null;
 }
+function stopSpeaking(){
+  try{ if (speechSynthesis.speaking || speechSynthesis.pending) speechSynthesis.cancel(); }catch{}
+}
 function say(text, lang){
+  S.sayLang = lang;
+  if (S.phase==="speaking") render();
   return new Promise(resolve => {
     if (!("speechSynthesis" in window)) return resolve();
     let done = false;
@@ -420,7 +540,7 @@ function say(text, lang){
     u.lang = lang; u.rate = S.rate;
     const v = pickVoice(lang); if (v) u.voice = v;
     u.onend = finish; u.onerror = finish;
-    speechSynthesis.cancel();
+    stopSpeaking();
     speechSynthesis.speak(u);
     // Filet de sécurité : certains navigateurs oublient parfois l'événement de fin
     const guard = () => { if (done) return; if (speechSynthesis.speaking || speechSynthesis.pending) setTimeout(guard, 500); else finish(); };
@@ -436,10 +556,11 @@ function addTurn(who, orig, tr, from, to){
   const tag = document.createElement("span"); tag.textContent = langName(from) + " → " + langName(to);
   const btn = document.createElement("button"); btn.textContent = "Réécouter";
   btn.onclick = async () => {
-    const wasListening = S.running && S.phase==="listening";
-    if (wasListening){ killRec(); S.phase = "speaking"; render(); }
+    if (S.phase==="translating" || S.phase==="speaking") return;
+    const flow = ++S.flow;
+    if (S.running){ killRec(); S.phase = "speaking"; }
     await say(tr, to);
-    if (wasListening && S.running) listen();
+    if (S.running && flow === S.flow) listen();
   };
   meta.append(tag, btn);
   const o = document.createElement("div"); o.className = "orig"; o.textContent = orig;
