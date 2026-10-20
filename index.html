@@ -385,17 +385,20 @@ function openRec(){
 }
 // Plusieurs écoutes ratées d'affilée : inutile d'insister, on attend un toucher
 // (sur iPhone, une relance faite depuis un geste de l'utilisateur a plus de chances de marcher).
-function micStuck(){
-  // Sur iPhone, une langue qui n'a jamais marché alors qu'une autre oui : c'est presque
-  // toujours la dictée de cette langue qui n'est pas installée sur le téléphone.
+function micStuck(refused = false){
+  // Sur iPhone, une langue refusée par la dictée, ou qui n'a jamais marché alors qu'une autre
+  // oui : la dictée de cette langue n'est pas installée sur le téléphone. Depuis l'icône de
+  // l'écran d'accueil, seules ces langues-là sont reconnues ; dans Safari, les autres passent
+  // par les serveurs d'Apple.
   const lang = fromLang();
-  const langMissing = IS_IOS && !S.langWorked[lang] && Object.keys(S.langWorked).length > 0;
+  const langMissing = IS_IOS && (refused || (!S.langWorked[lang] && Object.keys(S.langWorked).length > 0));
   S.stuckHint = langMissing
-    ? "La reconnaissance vocale ne marche pas pour « " + langName(lang) + " » sur ce téléphone. "
-      + (STANDALONE ? "Essayez dans Safari plutôt que depuis l'icône, ou ajoutez" : "Ajoutez")
-      + " le clavier de cette langue avec la dictée activée (Réglages > Général > Clavier > Claviers), puis touchez le bouton."
+    ? "L'iPhone refuse de reconnaître « " + langName(lang) + " ». "
+      + (STANDALONE
+        ? "Depuis l'icône de l'écran d'accueil, il ne reconnaît souvent que les langues de dictée installées : ouvrez la page dans Safari, ou ajoutez le clavier de cette langue avec la dictée (Réglages > Général > Clavier > Claviers)."
+        : "Ajoutez le clavier de cette langue avec la dictée activée (Réglages > Général > Clavier > Claviers), puis touchez le bouton.")
     : "";
-  log(langMissing ? "« " + langName(lang) + " » n'a jamais été reconnu sur cet appareil : dictée de cette langue absente ?" : "le micro ne repart pas, j'attends un toucher");
+  log(langMissing ? "« " + langName(lang) + " » refusé par la dictée de l'iPhone" : "le micro ne repart pas, j'attends un toucher");
   killRec();
   S.phase = "stuck";
   $("reload").hidden = false;
@@ -419,7 +422,7 @@ function startRec(id){
   rec.continuous = false;
   rec.interimResults = true;
   rec.maxAlternatives = 1;
-  let gotText = false, failed = false;
+  let gotText = false, failed = false, refused = false;
   const fail = () => { if (!failed){ failed = true; S.failures++; } };
   rec.onstart = () => {
     if (!mine()) return;
@@ -461,6 +464,9 @@ function startRec(id){
         : "Accès au micro refusé. Autorisez le micro pour ce site dans les réglages du navigateur.";
       return;
     }
+    // iPhone : « kAFAssistantErrorDomain erreur 7 » = la dictée refuse cette langue ;
+    // réessayer ne sert à rien (et sollicite les serveurs d'Apple pour rien)
+    if (IS_IOS && /kAFAssistantErrorDomain\D*7(?!\d)/.test(e.message || "")) refused = true;
     if (e.error !== "no-speech"){ S.lastAbort = Date.now(); fail(); } // laisse le micro se remettre avant de réessayer
   };
   rec.onend = () => {
@@ -471,7 +477,7 @@ function startRec(id){
     if (S.interim){ S.finalText = (S.finalText + " " + S.interim).trim(); S.interim = ""; }
     S.rec = null; S.recAlive = false; S.audioLive = false;
     if (!S.running || S.phase !== "listening") return;
-    if (S.failures >= MAX_FAILURES) micStuck(); else openRec();
+    if (refused || S.failures >= MAX_FAILURES) micStuck(refused); else openRec();
   };
   S.rec = rec; S.recStartedAt = S.lastEvent = Date.now();
   try{
