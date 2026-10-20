@@ -274,9 +274,15 @@ document.addEventListener("visibilitychange", () => {
 // Chaque session de reconnaissance s'arrête d'elle-même après un court silence.
 // On la relance aussitôt et on accumule le texte : c'est notre propre minuteur de
 // silence (réglable) qui décide quand le tour de parole est terminé.
+// Le navigateur n'accepte qu'une écoute à la fois : quand on en coupe une, on attend
+// qu'elle soit vraiment terminée avant d'en démarrer une autre.
 function killRec(){
   S.recId++;
-  if (S.rec){ try{ S.rec.abort(); }catch{} S.rec = null; }
+  if (S.rec){
+    const old = S.rec; S.rec = null;
+    S.dying = new Promise(res => { old.addEventListener("end", res); setTimeout(res, 700); });
+    try{ old.abort(); }catch{}
+  }
 }
 function listen(){
   if (!S.running) return;
@@ -289,13 +295,24 @@ function listen(){
 function openRec(){
   killRec();
   const id = S.recId;
+  S.lastEvent = Date.now(); S.recAlive = false;
+  const waitFor = S.dying; S.dying = null;
+  if (waitFor) waitFor.then(() => setTimeout(() => startRec(id), 120));
+  else startRec(id);
+}
+function startRec(id){
+  if (id !== S.recId || !S.running || S.phase !== "listening") return;
+  S.lastEvent = Date.now();
   const rec = new SR();
   rec.lang = fromLang();
   rec.continuous = false;
   rec.interimResults = true;
   rec.maxAlternatives = 1;
+  const alive = () => { if (id === S.recId){ S.recAlive = true; S.lastEvent = Date.now(); } };
+  rec.onstart = alive; rec.onaudiostart = alive; rec.onspeechstart = alive;
   rec.onresult = e => {
     if (id !== S.recId) return;
+    alive();
     let interim = "";
     for (let i = e.resultIndex; i < e.results.length; i++){
       const t = e.results[i][0].transcript;
@@ -308,6 +325,7 @@ function openRec(){
   };
   rec.onerror = e => {
     if (id !== S.recId) return;
+    S.lastEvent = Date.now();
     if (e.error==="not-allowed" || e.error==="service-not-allowed"){
       stop();
       $("status").textContent = "Accès au micro refusé. Autorisez le micro pour ce site dans les réglages du navigateur.";
@@ -318,10 +336,10 @@ function openRec(){
     // Le moteur a coupé : on garde l'éventuel texte provisoire et on relance l'écoute
     if (S.interim){ S.finalText = (S.finalText + " " + S.interim).trim(); S.interim = ""; }
     S.rec = null;
-    if (S.running && S.phase==="listening") setTimeout(() => { if (id === S.recId && S.phase==="listening") openRec(); }, 60);
+    if (S.running && S.phase==="listening") setTimeout(() => { if (id === S.recId && S.phase==="listening") openRec(); }, 120);
   };
   S.rec = rec;
-  try{ rec.start(); }catch{ setTimeout(() => S.phase==="listening" && openRec(), 300); }
+  try{ rec.start(); }catch{ S.rec = null; setTimeout(() => { if (id === S.recId && S.phase==="listening") openRec(); }, 400); }
 }
 function restartListening(){
   if (!S.running) return;
@@ -332,7 +350,12 @@ function tick(){
   if (!S.running) return;
   if (S.phase==="listening"){
     const text = (S.finalText + " " + S.interim).trim();
-    if (text && Date.now() - S.lastHeard > S.pause) endOfTurn(text);
+    if (text && Date.now() - S.lastHeard > S.pause){ endOfTurn(text); render(); return; }
+    // Sécurité : micro qui n'a jamais démarré, ou qui ne donne plus aucun signe de vie
+    if (Date.now() - S.lastEvent > (S.recAlive ? 10000 : 3000)){
+      if (S.interim){ S.finalText = (S.finalText + " " + S.interim).trim(); S.interim = ""; }
+      openRec();
+    }
     render();
   }
 }
@@ -357,7 +380,7 @@ async function endOfTurn(text){
   await say(tr, to);
   if (!S.running) return;
   if (S.mode==="conv") S.turn = speaker==="A" ? "B" : "A";
-  setTimeout(() => S.running && S.phase==="speaking" && listen(), 250); // laisse retomber l'écho du haut-parleur
+  setTimeout(() => S.running && S.phase==="speaking" && listen(), 400); // laisse retomber l'écho du haut-parleur
 }
 
 const shortCode = c => (c==="zh-CN" || c==="pt-BR") ? c : c.split("-")[0];
