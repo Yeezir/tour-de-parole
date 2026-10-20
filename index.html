@@ -93,6 +93,10 @@ summary{font-weight:700;cursor:pointer}
 <div class="wrap">
   <h1>Tour de Parole<small>Posez le téléphone, parlez, il traduit à voix haute après chaque phrase.</small></h1>
 
+  <div id="inAppWarn" class="warn" hidden>
+    Ce lien s'est ouvert à l'intérieur d'une autre appli, où le micro ne marche pas. Ouvrez-le dans <b>Safari</b> (iPhone) ou <b>Chrome</b> (Android) : touchez le menu <b>⋯</b> puis « Ouvrir dans le navigateur ».
+  </div>
+
   <div id="iconWarn" class="warn" hidden>
     Ouverte depuis l'icône de l'écran d'accueil, l'appli ne reconnaît souvent que la langue du téléphone. Pour converser dans deux langues, ouvrez <b id="pageUrl"></b> dans Safari.
   </div>
@@ -173,6 +177,9 @@ const $ = id => document.getElementById(id);
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 const IS_IOS = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
 const STANDALONE = navigator.standalone === true || matchMedia("(display-mode: standalone)").matches; // ouverte depuis l'écran d'accueil
+const IS_ANDROID = /Android/.test(navigator.userAgent);
+// Lien ouvert à l'intérieur d'une autre appli (Messenger, Instagram, appli Google…) : le micro n'y marche pas
+const IN_APP = /FBAN|FBAV|FB_IAB|Instagram|Snapchat|LinkedInApp|Line\/|GSA\/|musical_ly|Bytedance|; wv\)/.test(navigator.userAgent);
 // Sur iPhone, un micro relancé moins d'une seconde après avoir été coupé reste « sourd » :
 // on laisse ce délai entre une coupure et la reprise (il s'écoule en général pendant la
 // lecture de la traduction). Après une lecture, on attend juste que le haut-parleur se taise.
@@ -198,7 +205,7 @@ const S = {
   flow:0,                               // change à chaque interruption : les suites devenues caduques s'arrêtent
   rec:null, recId:0, dying:null, startTimer:null,
   recAlive:false, audioLive:false, sawAudioStart:false, failures:0,
-  langWorked:{}, stuckHint:"",          // langues déjà reconnues au moins une fois sur cet appareil
+  langWorked:{}, stuckHint:"", lastError:"",   // langues déjà reconnues au moins une fois sur cet appareil
   recStartedAt:0, lastEvent:0, lastAbort:0, lastSpeechEnd:0, notLiveSince:0,
   finalText:"", interim:"", lastHeard:0, sayLang:"",
   ticker:null, wake:null, log:[]
@@ -299,8 +306,34 @@ function render(){
   orb.title = "Toucher pour mettre en pause";
 }
 
-if (!SR){ $("unsupported").hidden = false; }
+if (IN_APP) $("inAppWarn").hidden = false;
+else if (!SR) $("unsupported").hidden = false;
 if (IS_IOS && STANDALONE){ $("pageUrl").textContent = location.host + location.pathname; $("iconWarn").hidden = false; }
+
+// Ce que la personne peut faire, selon l'erreur renvoyée par la reconnaissance vocale
+function errorHelp(code){
+  switch (code){
+    case "not-allowed":
+      return IS_IOS
+        ? "Le micro est refusé pour ce site. Dans les Réglages de l'iPhone : Safari (ou Apps > Safari) > Micro > « Demander », et Confidentialité et sécurité > Reconnaissance vocale > Safari activé. Puis rechargez la page."
+        : IS_ANDROID
+          ? "Le micro est refusé pour ce site. Touchez l'icône à gauche de l'adresse > Autorisations > Micro > Autoriser, puis rechargez la page."
+          : "Le micro est refusé pour ce site. Cliquez sur l'icône à gauche de l'adresse, autorisez le micro, puis rechargez la page.";
+    case "service-not-allowed":
+      return IS_IOS
+        ? "La dictée est désactivée sur cet iPhone. Activez-la (Réglages > Général > Clavier > Activer la dictée), puis rechargez la page."
+        : IS_ANDROID
+          ? "La reconnaissance vocale de Google est indisponible. Vérifiez que l'appli Google est installée et activée, puis rechargez la page."
+          : "La reconnaissance vocale est désactivée. Sur Mac, activez la dictée (Réglages Système > Clavier > Dictée), puis rechargez la page.";
+    case "audio-capture":
+      return "Le micro n'est pas disponible : il est peut-être utilisé par une autre appli (appel en cours, mémo vocal…). Fermez-la puis touchez le bouton.";
+    case "network":
+      return "La reconnaissance vocale a besoin d'internet : vérifiez la connexion, puis touchez le bouton.";
+    case "language-not-supported":
+      return "Ce navigateur ne reconnaît pas la langue « " + langName(fromLang()) + " ».";
+  }
+  return "";
+}
 
 // ---------- Démarrage / arrêt ----------
 $("orb").onclick = () => S.phase==="stuck" ? resumeAfterStuck() : S.running ? stop() : start();
@@ -400,7 +433,7 @@ function micStuck(refused = false){
       + (STANDALONE
         ? "Depuis l'icône de l'écran d'accueil, il ne reconnaît souvent que la langue du téléphone : ouvrez la page dans Safari."
         : "Vérifiez que le clavier de cette langue est ajouté avec la dictée activée (Réglages > Général > Clavier > Claviers), ou réessayez un peu plus tard : l'iPhone limite le nombre d'écoutes.")
-    : "";
+    : errorHelp(S.lastError);
   log(langMissing ? "« " + langName(lang) + " » refusé par la dictée de l'iPhone" : "le micro ne repart pas, j'attends un toucher");
   killRec();
   S.phase = "stuck";
@@ -443,7 +476,7 @@ function startRec(id){
   rec.onnomatch     = () => { if (mine()) log("rien de compris"); };
   rec.onresult = e => {
     if (!mine()) return;
-    S.failures = 0; S.langWorked[rec.lang] = true;
+    S.failures = 0; S.langWorked[rec.lang] = true; S.lastError = "";
     S.recAlive = true; S.lastEvent = S.lastHeard = Date.now();
     if (S.sawAudioStart) S.audioLive = true;
     let interim = "";
@@ -462,14 +495,13 @@ function startRec(id){
     log("erreur : " + e.error + (e.message ? " (" + e.message + ")" : ""));
     if (e.error==="not-allowed" || e.error==="service-not-allowed"){
       stop();
-      $("status").textContent = IS_IOS
-        ? "Micro ou dictée refusés. Autorisez le micro pour ce site, et activez la dictée (Réglages > Général > Clavier)."
-        : "Accès au micro refusé. Autorisez le micro pour ce site dans les réglages du navigateur.";
+      $("status").textContent = errorHelp(e.error);
       return;
     }
+    if (e.error !== "no-speech") S.lastError = e.error;
     // iPhone : « kAFAssistantErrorDomain erreur 7 » = la dictée refuse cette langue ;
     // réessayer ne sert à rien (et sollicite les serveurs d'Apple pour rien)
-    if (IS_IOS && /kAFAssistantErrorDomain\D*7(?!\d)/.test(e.message || "")) refused = true;
+    if (e.error==="language-not-supported" || (IS_IOS && /kAFAssistantErrorDomain\D*7(?!\d)/.test(e.message || ""))) refused = true;
     if (e.error !== "no-speech"){ S.lastAbort = Date.now(); fail(); } // laisse le micro se remettre avant de réessayer
   };
   rec.onend = () => {
