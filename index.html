@@ -123,6 +123,7 @@ summary{font-weight:700;cursor:pointer}
     <div class="live" id="live"></div>
     <div class="row">
       <button class="ghost" id="skip" hidden>Changer de locuteur</button>
+      <button class="ghost" id="reload" hidden>Recharger l'appli</button>
     </div>
   </div>
 
@@ -169,9 +170,12 @@ const LANGS = [
 const $ = id => document.getElementById(id);
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 const IS_IOS = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
-// Sur iPhone, un micro relancé trop vite après avoir été coupé reste « sourd » :
-// on laisse toujours au moins ce délai entre une coupure et la reprise.
+// Sur iPhone, un micro relancé trop vite après avoir été coupé, ou juste après une lecture
+// à voix haute (le temps que l'iPhone rebascule son audio), reste « sourd » :
+// on laisse toujours au moins ces délais avant de rouvrir le micro.
 const RESTART_GAP = IS_IOS ? 3000 : 300;
+const AFTER_SPEECH_GAP = IS_IOS ? 1500 : 400;
+const MAX_FAILURES = 3;   // écoutes ratées d'affilée avant de demander un toucher
 const T0 = Date.now();
 
 const store = {
@@ -186,12 +190,12 @@ const S = {
   pause: store.get("pause",1400),
   rate:  store.get("rate",0.95),
   repeatOrig: store.get("repeatOrig",false),
-  running:false, phase:"idle",          // idle | listening | translating | speaking
+  running:false, phase:"idle",          // idle | listening | translating | speaking | stuck
   turn:"A",
   flow:0,                               // change à chaque interruption : les suites devenues caduques s'arrêtent
   rec:null, recId:0, dying:null, startTimer:null,
-  recAlive:false, audioLive:false, sawAudioStart:false,
-  recStartedAt:0, lastEvent:0, lastAbort:0, notLiveSince:0,
+  recAlive:false, audioLive:false, sawAudioStart:false, failures:0,
+  recStartedAt:0, lastEvent:0, lastAbort:0, lastSpeechEnd:0, notLiveSince:0,
   finalText:"", interim:"", lastHeard:0, sayLang:"",
   ticker:null, wake:null, log:[]
 };
@@ -249,6 +253,7 @@ $("rate").oninput  = e => { S.rate  = +e.target.value; store.set("rate",S.rate);
 $("repeatOrig").onchange = e => { S.repeatOrig = e.target.checked; store.set("repeatOrig",S.repeatOrig); };
 $("clear").onclick = () => { $("log").querySelectorAll(".turn").forEach(n=>n.remove()); $("empty").hidden = false; };
 $("skip").onclick = () => switchSpeaker();
+$("reload").onclick = () => location.reload();
 showSettings();
 
 const langName   = code => (LANGS.find(l=>l[0]===code)||[code,code])[1];
@@ -283,6 +288,9 @@ function render(){
     orb.classList.add("speaking");
     orb.textContent = langName(S.sayLang || toLang());
     $("status").textContent = "Lecture à voix haute…";
+  } else if (S.phase==="stuck"){
+    orb.textContent = "Toucher pour relancer";
+    $("status").textContent = "Le téléphone a bloqué le micro. Touchez le bouton pour le relancer ; si ça ne repart pas, rechargez l'appli.";
   }
   orb.title = "Toucher pour mettre en pause";
 }
@@ -290,13 +298,14 @@ function render(){
 if (!SR){ $("unsupported").hidden = false; }
 
 // ---------- Démarrage / arrêt ----------
-$("orb").onclick = () => S.running ? stop() : start();
+$("orb").onclick = () => S.phase==="stuck" ? resumeAfterStuck() : S.running ? stop() : start();
 
 function start(){
   if (!SR){ $("unsupported").hidden = false; return; }
   S.running = true; S.flow++;
-  // Débloque la synthèse vocale sur mobile (doit partir d'un geste)
-  try{ speechSynthesis.speak(new SpeechSynthesisUtterance(" ")); }catch{}
+  // Débloque la synthèse vocale sur mobile (doit partir d'un geste). C'est une lecture
+  // comme une autre : le micro attendra AFTER_SPEECH_GAP avant de s'ouvrir.
+  try{ speechSynthesis.speak(new SpeechSynthesisUtterance(" ")); S.lastSpeechEnd = Date.now(); }catch{}
   keepAwake();
   $("skip").hidden = S.mode!=="conv";
   log("démarrage");
@@ -309,20 +318,28 @@ function stop(){
   killRec();
   stopSpeaking();
   if (S.wake){ S.wake.release().catch(()=>{}); S.wake = null; }
-  $("skip").hidden = true;
+  $("skip").hidden = true; $("reload").hidden = true;
   $("status").textContent = "En pause. Touchez pour reprendre.";
   $("live").textContent = "";
   log("pause");
   render();
 }
 async function keepAwake(){
-  try{ S.wake = await navigator.wakeLock?.request("screen"); }catch{}
+  try{
+    S.wake = await navigator.wakeLock?.request("screen");
+    log(S.wake ? "écran maintenu allumé" : "maintien de l'écran indisponible");
+  }catch(e){ log("maintien de l'écran refusé"); }
 }
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState !== "visible" || !S.running) return;
+  log(document.visibilityState==="visible" ? "appli visible" : "appli masquée");
+  if (!S.running) return;
+  if (document.visibilityState !== "visible"){
+    // Écran verrouillé ou autre appli : le système coupe le micro, on le rouvrira au retour
+    if (S.phase==="listening") killRec();
+    return;
+  }
   if (!S.wake) keepAwake();
-  // En revenant sur l'appli, l'écoute a souvent été coupée par le système : on la relance
-  if (S.phase==="listening"){ log("retour sur l'appli"); openRec(); }
+  if (S.phase==="listening") openRec();
 });
 
 // ---------- Écoute ----------
@@ -348,6 +365,7 @@ function listen(){
   S.phase = "listening";
   S.finalText = ""; S.interim = "";
   $("live").textContent = "";
+  $("reload").hidden = true;
   openRec();
 }
 function openRec(){
@@ -356,10 +374,30 @@ function openRec(){
   const dying = S.dying; S.dying = null;
   Promise.resolve(dying).then(() => {
     if (id !== S.recId) return;
-    const wait = Math.max(120, S.lastAbort + RESTART_GAP - Date.now());
-    if (wait > 300) log("attente de " + (wait/1000).toFixed(1) + " s pour laisser le micro se remettre");
+    const now = Date.now();
+    const wait = Math.max(120, S.lastAbort + RESTART_GAP - now, S.lastSpeechEnd + AFTER_SPEECH_GAP - now);
+    if (wait > 450) log("attente de " + (wait/1000).toFixed(1) + " s avant de rouvrir le micro");
     S.startTimer = setTimeout(() => startRec(id), wait);
   });
+  render();
+}
+// Plusieurs écoutes ratées d'affilée : inutile d'insister, on attend un toucher
+// (sur iPhone, une relance faite depuis un geste de l'utilisateur a plus de chances de marcher).
+function micStuck(){
+  log("le micro ne repart pas, j'attends un toucher");
+  killRec();
+  S.phase = "stuck";
+  $("reload").hidden = false;
+  render();
+}
+function resumeAfterStuck(){
+  log("relance demandée");
+  S.failures = 0;
+  S.phase = "listening"; S.finalText = ""; S.interim = "";
+  $("live").textContent = ""; $("reload").hidden = true;
+  if (!S.wake) keepAwake();
+  killRec();
+  startRec(S.recId);
   render();
 }
 function startRec(id){
@@ -370,7 +408,8 @@ function startRec(id){
   rec.continuous = false;
   rec.interimResults = true;
   rec.maxAlternatives = 1;
-  let gotText = false;
+  let gotText = false, failed = false;
+  const fail = () => { if (!failed){ failed = true; S.failures++; } };
   rec.onstart = () => {
     if (!mine()) return;
     S.recAlive = true; S.lastEvent = Date.now();
@@ -381,8 +420,13 @@ function startRec(id){
     S.recAlive = S.audioLive = S.sawAudioStart = true; S.lastEvent = Date.now();
     log("micro ouvert"); render();
   };
+  rec.onsoundstart  = () => { if (mine()){ S.lastEvent = Date.now(); log("son détecté"); } };
+  rec.onspeechstart = () => { if (mine()){ S.lastEvent = Date.now(); log("voix détectée"); } };
+  rec.onaudioend    = () => { if (mine()) log("micro fermé"); };
+  rec.onnomatch     = () => { if (mine()) log("rien de compris"); };
   rec.onresult = e => {
     if (!mine()) return;
+    S.failures = 0;
     S.recAlive = true; S.lastEvent = S.lastHeard = Date.now();
     if (S.sawAudioStart) S.audioLive = true;
     let interim = "";
@@ -406,15 +450,17 @@ function startRec(id){
         : "Accès au micro refusé. Autorisez le micro pour ce site dans les réglages du navigateur.";
       return;
     }
-    if (e.error !== "no-speech") S.lastAbort = Date.now(); // laisse le micro se remettre avant de réessayer
+    if (e.error !== "no-speech"){ S.lastAbort = Date.now(); fail(); } // laisse le micro se remettre avant de réessayer
   };
   rec.onend = () => {
     if (!mine()) return;
     log("fin de l'écoute");
+    if (!gotText && Date.now() - S.recStartedAt < 1500) fail();   // écoute terminée aussitôt lancée
     // Le moteur a coupé : on garde l'éventuel texte provisoire et on relance l'écoute
     if (S.interim){ S.finalText = (S.finalText + " " + S.interim).trim(); S.interim = ""; }
     S.rec = null; S.recAlive = false; S.audioLive = false;
-    if (S.running && S.phase==="listening") openRec();
+    if (!S.running || S.phase !== "listening") return;
+    if (S.failures >= MAX_FAILURES) micStuck(); else openRec();
   };
   S.rec = rec; S.recStartedAt = S.lastEvent = Date.now();
   try{
@@ -431,6 +477,7 @@ function startRec(id){
 function switchSpeaker(){
   S.turn = S.turn==="A" ? "B" : "A";
   const flow = ++S.flow;
+  S.failures = 0;
   log("changement de locuteur : " + langName(fromLang()));
   if (!S.running){ render(); return; }
   killRec();
@@ -445,7 +492,7 @@ function switchSpeaker(){
 }
 function restartListening(){
   if (!S.running) return;
-  S.flow++;
+  S.flow++; S.failures = 0;
   stopSpeaking();
   listen();
 }
@@ -457,13 +504,14 @@ function tick(){
   // Sécurité : une écoute qui ne démarre pas, reste muette ou ne donne plus signe de vie est relancée
   if (S.rec){
     const age = now - S.recStartedAt;
-    let why = "";
+    let why = "", broken = true;
     if (!S.recAlive && age > 4000) why = "l'écoute ne démarre pas";
     else if (S.sawAudioStart && !S.audioLive && age > 4000) why = "le micro ne s'ouvre pas";
-    else if (now - S.lastEvent > (IS_IOS ? 15000 : 10000)) why = "plus aucun signe du micro";
+    else if (now - S.lastEvent > (IS_IOS ? 15000 : 10000)){ why = "plus aucun signe du micro"; broken = false; } // peut-être juste du silence
     if (why){
       log(why + ", je relance");
       if (S.interim){ S.finalText = (S.finalText + " " + S.interim).trim(); S.interim = ""; }
+      if (broken && ++S.failures >= MAX_FAILURES){ micStuck(); return; }
       openRec();
       return;
     }
@@ -495,7 +543,7 @@ async function endOfTurn(text){
   if (flow === S.flow) await say(tr, to);
   if (flow !== S.flow || !S.running) return;
   if (S.mode==="conv") S.turn = speaker==="A" ? "B" : "A";
-  setTimeout(() => { if (flow === S.flow && S.running) listen(); }, 400); // laisse retomber l'écho du haut-parleur
+  listen(); // le micro ne rouvre qu'après AFTER_SPEECH_GAP (écho du haut-parleur, bascule audio de l'iPhone)
 }
 
 const shortCode = c => (c==="zh-CN" || c==="pt-BR") ? c : c.split("-")[0];
@@ -535,7 +583,8 @@ function say(text, lang){
   return new Promise(resolve => {
     if (!("speechSynthesis" in window)) return resolve();
     let done = false;
-    const finish = () => { if (!done){ done = true; resolve(); } };
+    const finish = () => { if (!done){ done = true; S.lastSpeechEnd = Date.now(); log("fin de lecture"); resolve(); } };
+    log("lecture en " + langName(lang) + " : « " + (text.length > 40 ? text.slice(0, 40) + "…" : text) + " »");
     const u = new SpeechSynthesisUtterance(text);
     u.lang = lang; u.rate = S.rate;
     const v = pickVoice(lang); if (v) u.voice = v;
